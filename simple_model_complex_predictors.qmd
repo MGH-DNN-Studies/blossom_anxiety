@@ -30,13 +30,15 @@ require(mlbench)
 require(givitiR)
 
 # parameters
-n_folds <- 5
+n_folds <- 10
 bdi_min <- 0
 c_cutoff <- 1.0
 carryforward_outcome <- TRUE
 dyad_filter <- "left" # options: "left", "right", "all"
 metric_filter <- c('Imag_Coherence', 'WPPC')
+network_filter <- "frontal" # options: NULL, frontal, parietal, temporal, occipital
 shap_report <- TRUE
+penalty_term <- 0.1
 ```
 
 ## Load and format data
@@ -85,12 +87,37 @@ table(idx_missing[, 2])/nrow(X) >= 0.3 # don't bother imputing if missing rate >
 # drop all missing since rate is high
 X <- X[, !names(X) %in% names(X)[unique(idx_missing[, 2])]]
 
-# keep only simple predictors: demogrpahics and baseline symptoms
-X <- X[, c('age', 'gender_M', 'bdi_1_1_bdi', 'bai_1_1_bai', 'msm', 'cgi_s_1_1_cgi',
-           grep('Delta_Coherence', names(X), value = T))]
+# names of non-eeg features to keep
+X_non_eeg <- c('age', 'gender_M', 'bdi_1_1_bdi', 'bai_1_1_bai', 'msm', 'cgi_s_1_1_cgi', 
+               grep('tms_', names(X), value = T))
+
 ```
 
-## 
+## Filter features on metric
+
+```{r}
+if(!is.null(metric_filter)){
+  metric_drop <- grep(paste0(metric_filter, collapse = "|"), names(X), value = T)
+  X <- X[, !names(X) %in% metric_drop]
+}
+```
+
+## Network filter
+
+```{r}
+if(!is.null(network_filter)){
+  if(network_filter == 'frontal'){
+    X <- X[, c(X_non_eeg, grep('F._F', names(X), value = T))]  
+  }else if(network_filter == 'parietal'){
+    X <- X[, c(X_non_eeg, grep('P._P', names(X), value = T))]  
+  }else if(network_filter == 'temporal'){
+    X <- X[, c(X_non_eeg, grep('T._T', names(X), value = T))]  
+  }else if(network_filter == 'occipital'){
+    X <- X[, c(X_non_eeg, grep('O._O', names(X), value = T))]  
+  }
+  
+}
+```
 
 ## Patient table
 
@@ -132,7 +159,7 @@ data_clf$outcome <- as.factor(data_clf$outcome)
 set.seed(123)
 cv_splits <- vfold_cv(data_clf, v = n_folds, repeats = 10, strata = outcome)
 
-model_spec <- logistic_reg(mixture = 1, penalty = 0.1) %>%
+model_spec <- logistic_reg(mixture = 1, penalty = penalty_term) %>%
   set_engine("glmnet") %>%
   set_mode("classification")
 
@@ -304,7 +331,7 @@ if(shap_report){
   refit_data <- data.frame(outcome=y, X)
   refit_data$outcome <- as.factor(refit_data$outcome)
   
-  model_spec <- logistic_reg(mixture = 1, penalty = 0.1) %>%
+  model_spec <- logistic_reg(mixture = 1, penalty = penalty_term) %>%
     set_engine("glmnet") %>%
     set_mode("classification")
 
