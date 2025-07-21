@@ -1,0 +1,353 @@
+---
+title: "Simple Model Simple Predictors: Logistic Regression"
+format: html
+editor: visual
+---
+
+## Set environment and parameters
+
+```{r}
+#| warning: false
+require(tidymodels)
+require(caret)
+require(dplyr)
+require(stringr)
+require(tableone)
+require(dcurves)
+require(doParallel)
+require(kernelshap)
+require(treeshap)
+require(shapviz)
+require(probably)
+require(ResourceSelection)
+require(knitr)
+require(ggpubr)
+require(SuperLearner)
+require(RhpcBLASctl)
+require(xgboost)
+require(betacal)
+require(mlbench)
+require(givitiR)
+
+# parameters
+n_folds <- 5
+bdi_min <- 0
+c_cutoff <- 1.0
+carryforward_outcome <- TRUE
+dyad_filter <- "left" # options: "left", "right", "all"
+metric_filter <- c('Imag_Coherence', 'WPPC')
+shap_report <- TRUE
+```
+
+## Load and format data
+
+```{r}
+data <- read.csv('~/Google Drive/My Drive/MGH/Studies/EEG_Taiwan_Study/ML_Anxiety/data/formatted_data_for_prediction.csv')
+
+# keep cases with complete outcome measures, filter unwanted variables, convert outcome to factor
+
+if(carryforward_outcome){
+  
+  print("Using carryforward outcomes")
+  
+  data_clf <- data %>%
+    filter(complete.cases(bai_remitter_carryforward)) %>%
+    filter(bdi_1_1_bdi >= bdi_min) %>%  # minimum depression severity for entry
+    dplyr::select(-matches("_2_12_|_1_12_|id|_change")) %>%
+    dplyr::select(-bdi_responder, -bai_responder, -bdi_remitter, -bai_remitter,
+                  -cgi_responder, -bai_responder_carryforward, -bai_responder_carryforward)
+  
+  # set X, y
+  X <- data_clf %>% dplyr::select(-bai_remitter_carryforward)
+  y <- data_clf$bai_remitter_carryforward
+  
+}else{
+  
+  print("Excluding carryforward outcomes")
+  
+  data_clf <- data %>%
+    filter(complete.cases(bai_remitter)) %>%
+    filter(bdi_1_1_bdi >= bdi_min) %>%  # minimum depression severity for entry
+    dplyr::select(-matches("_2_12_|_1_12_|id|_change")) %>%
+    dplyr::select(-bdi_responder, -bai_responder, -bdi_remitter, -bai_remitter_carryforward,
+                  -cgi_responder, -bai_responder_carryforward, -bai_responder_carryforward)
+  
+  # set X, y
+  X <- data_clf %>% dplyr::select(-bai_remitter)
+  y <- data_clf$bai_remitter
+  
+}
+
+# check missings
+idx_missing <- which(is.na(X), arr.ind = T)
+table(idx_missing[, 2])/nrow(X) >= 0.3 # don't bother imputing if missing rate >=30%
+
+# drop all missing since rate is high
+X <- X[, !names(X) %in% names(X)[unique(idx_missing[, 2])]]
+
+# keep only simple predictors: demogrpahics and baseline symptoms
+X <- X[, c('age', 'gender_M', 'bdi_1_1_bdi', 'bai_1_1_bai', 'msm', 'cgi_s_1_1_cgi')]
+```
+
+## 
+
+## Patient table
+
+```{r}
+# patient summary table
+patient_summary_table <- function(data){
+  
+  # summarize
+  cat_vars <- grep('bai_remitter|gender_M|tms_1_1_', names(data), value = T)
+  
+  summary_vars <- unique(c(grep('age|bai_|bdi_|cgi_|msm', names(data), value = T), cat_vars))
+  
+  tab_one <- CreateTableOne(vars=summary_vars,
+                            strata = grep('bai_remitter', names(data), value = T),
+                            factorVars = cat_vars,
+                            addOverall = TRUE,
+                            data=data)
+  kableone(tab_one)
+  
+}
+
+patient_summary_table(data = data_clf)
+```
+
+## Print predictors
+
+```{r}
+print(head(X))
+```
+
+## Fit logistic regression model
+
+```{r}
+# remerge data
+data_clf <- data.frame(outcome=y, X)
+data_clf$outcome <- as.factor(data_clf$outcome)
+
+# split data
+set.seed(123)
+cv_splits <- vfold_cv(data_clf, v = n_folds, repeats = 10, strata = outcome)
+
+model_spec <- logistic_reg() %>%
+  set_engine("glm") %>%
+  set_mode("classification")
+
+model_recipe <- recipe(outcome ~ ., data = data_clf) %>%
+  step_normalize(all_numeric_predictors())
+
+workflow_obj <- workflow() %>%
+  add_model(model_spec) %>%
+  add_recipe(model_recipe)
+
+set.seed(123)
+logit_res <- fit_resamples(
+  workflow_obj,
+  resamples = cv_splits,
+  metrics = metric_set(roc_auc, pr_auc),
+  control = control_resamples(save_pred = TRUE)
+)
+```
+
+## Model performance
+
+### Summary: AUC
+
+```{r}
+collect_metrics(logit_res)
+```
+
+### 
+
+## Check calibration
+
+```{r}
+# save predicted probabilities for each model
+sl_probs <- data.frame(outcome=collect_predictions(logit_res)$outcome,
+                       probs=collect_predictions(logit_res)$.pred_1)
+
+# Fit beta calibration model
+calibration_model <- beta_calibration(
+  p = sl_probs$probs,
+  y = sl_probs$outcome,
+  parameters = "abm"
+)
+
+calibrated_probs <- beta_predict(sl_probs$probs, calibration_model)
+
+# check calibration with giviti
+belt_uncal <- givitiCalibrationBelt(as.numeric(as.character(sl_probs$outcome)), sl_probs$probs, devel = "external")
+belt_cal <- givitiCalibrationBelt(as.numeric(as.character(sl_probs$outcome)), calibrated_probs, devel = "external")
+
+par(mfrow=c(1, 2))
+plot(belt_uncal, main = 'Uncalibrated')
+plot(belt_cal, main = 'Beta Calibration')
+
+if(belt_uncal$statistic <= belt_cal$statistic){
+  print("Uncalibrated model GiViTI statistic value is as good or better than beta calibration")
+  print(sprintf("Beta calibration = %s; Uncalibrated = %s", belt_cal$statistic, belt_uncal$statistic))
+  
+  # set final model
+  sl_probs$preds_final <- sl_probs$preds
+  
+}else{
+  print("Beta calibrated model GiViTI statistic value is better than uncalibrated")
+  print(sprintf("Beta calibration = %s; Uncalibrated = %s", belt_cal$statistic, belt_uncal$statistic))
+  
+  # set final model
+  sl_probs$preds_final <- calibrated_probs
+}
+```
+
+### ROC and PR Curves
+
+```{r}
+# determine whether first or second level is needed
+print(head(as.factor(sl_probs$outcome)))
+
+# compute roc and pr curves
+roc_plot <- sl_probs %>%
+  mutate(outcome=as.factor(outcome)) %>%
+  roc_curve(outcome, preds_final, event_level = 'second') %>%
+  autoplot()
+
+pr_plot <- sl_probs %>%
+  mutate(outcome=as.factor(outcome)) %>%
+  pr_curve(outcome, preds_final, event_level = 'second') %>%
+  autoplot()
+
+ggarrange(roc_plot, pr_plot, ncol = 2, nrow = 1)
+```
+
+## Decision Curve Analysis
+
+```{r}
+dc_data <- dcurves::dca(outcome ~ preds_final, data = sl_probs) %>%
+  plot(smooth = TRUE)
+  
+dc_data
+
+# calculate difference in model-based versus treat-all-based net benefit
+dc_df <- data.frame(dc_data$data)
+dc_df_ta <- dc_df[dc_df$label=='Treat All', ]
+dc_df_mod <- dc_df[dc_df$label=='preds_final', ]
+dc_df_mod$net_benefit_gain <- dc_df_mod$net_benefit - dc_df_ta$net_benefit
+
+# subset over "reasonable range" and region of imporovement
+tmp <- dc_df_mod[dc_df_mod$threshold < 0.45 & dc_df_mod$net_benefit_gain > 0, ]
+tmp$nnt_gain <- (1/tmp$net_benefit_gain)
+tmp$log_nnt_gain <- log(tmp$nnt_gain)
+
+
+p1 <- ggplot(tmp, aes(threshold, net_benefit_gain)) + 
+  geom_point(col='lightblue', size = 2) + 
+  geom_line() + 
+  ylab("Net Benefit Gain") + 
+  xlab("Threshold Probability") + 
+  theme_bw()
+
+p2 <- ggplot(tmp, aes(threshold, log_nnt_gain)) + 
+  geom_point(col='lightblue', size = 2) + 
+  geom_line() + 
+  ylab("Log NNT Gain") + 
+  xlab("Threshold Probability") + 
+  theme_bw()
+
+ggarrange(p1, p2, ncol=2, nrow=1)
+
+# report gain in NNT quantiles
+kable(quantile(tmp$nnt_gain), caption = "NNT Gain Quantiles")
+```
+
+## Remission rates by cross-validated remission probability deciles
+
+```{r}
+pdist <- sl_probs$preds_final
+
+decile_membership <- ntile(pdist, 4) # adjust to accomodate sample size
+
+decile_df <- data.frame(
+  pdist=pdist,
+  remission=sl_probs$outcome,
+  decile=decile_membership
+)
+
+decile_df %>%
+  group_by(decile) %>%
+  summarise(support = n(),
+            min_p = min(pdist),
+            proportion_remission = sum(remission==1) / n()) %>%
+  kable()
+
+decile_plt <- decile_df %>%
+  group_by(decile) %>%
+  summarise(support = n(),
+            min_p = min(pdist),
+            proportion_remission = sum(remission==1) / n()) 
+  
+ggplot(decile_plt, aes(as.factor(decile), proportion_remission)) + 
+  geom_bar(stat = 'identity') + 
+  ylim(0, 1) + 
+  geom_hline(yintercept=0.5, linetype="dashed", color = "red") +
+  theme_bw()
+```
+
+## SHAP analysis
+
+```{r}
+
+if(shap_report){
+
+  refit_data <- data.frame(outcome=y, X)
+  refit_data$outcome <- as.factor(refit_data$outcome)
+  
+  model_spec <- logistic_reg() %>%
+    set_engine("glm") %>%
+    set_mode("classification")
+
+  model_recipe <- recipe(outcome ~ ., data = refit_data) %>%
+    step_normalize(all_numeric_predictors())
+  
+  workflow_obj <- workflow() %>%
+    add_model(model_spec) %>%
+    add_recipe(model_recipe)
+    
+  set.seed(123)
+  shap_mod <- workflow_obj %>%
+    fit(refit_data)
+  
+  shap_data <- refit_data %>% dplyr::select(-outcome)
+  
+  pred_fun <- function(object, newdata) {
+    predict(object, newdata, type = "prob") %>% dplyr::select(2)  # Probability of class "1"
+  }
+  
+  set.seed(1)
+  shap_sample_index <- sample(x=1:nrow(shap_data), size = 50, replace = FALSE)
+  
+  shap_explainer <- kernelshap(shap_mod, 
+                               X = shap_data, 
+                               bg_X = shap_data[shap_sample_index, ],
+                               pred_fun = pred_fun, 
+                               verbose = FALSE)
+
+}else{
+  print("Skipping SHAP")
+}
+  
+```
+
+### Beeswarm plot
+
+```{r}
+
+if(shap_report){
+  sv <- shapviz(shap_explainer, X = shap_data)
+  beeswarm <- sv_importance(sv, kind = "bee")
+  beeswarm
+}else{
+  print("Skipping SHAP")
+}
+```

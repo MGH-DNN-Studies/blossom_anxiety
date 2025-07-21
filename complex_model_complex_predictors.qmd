@@ -1,0 +1,418 @@
+---
+title: "Superlearner_Pipeline_Blossom_Anxiety_Simple_Model"
+format: html
+editor: visual
+---
+
+## Set environment and parameters
+
+```{r}
+#| warning: false
+require(tidymodels)
+require(caret)
+require(dplyr)
+require(stringr)
+require(tableone)
+require(dcurves)
+require(doParallel)
+require(kernelshap)
+require(treeshap)
+require(shapviz)
+require(probably)
+require(ResourceSelection)
+require(knitr)
+require(ggpubr)
+require(SuperLearner)
+require(RhpcBLASctl)
+require(xgboost)
+require(betacal)
+require(mlbench)
+require(givitiR)
+
+# parameters
+n_folds <- 10
+bdi_min <- 0
+c_cutoff <- 1.0
+carryforward_outcome <- TRUE
+dyad_filter <- "left" # options: "left", "right", "all"
+metric_filter <- c('Imag_Coherence', 'WPPC')
+shap_report <- FALSE
+```
+
+## Load and format data
+
+```{r}
+data <- read.csv('~/Google Drive/My Drive/MGH/Studies/EEG_Taiwan_Study/ML_Anxiety/data/formatted_data_for_prediction.csv')
+
+# keep cases with complete outcome measures, filter unwanted variables, convert outcome to factor
+
+if(carryforward_outcome){
+  
+  print("Using carryforward outcomes")
+  
+  data_clf <- data %>%
+    filter(complete.cases(bai_remitter_carryforward)) %>%
+    filter(bdi_1_1_bdi >= bdi_min) %>%  # minimum depression severity for entry
+    dplyr::select(-matches("_2_12_|_1_12_|id|_change")) %>%
+    dplyr::select(-bdi_responder, -bai_responder, -bdi_remitter, -bai_remitter,
+                  -cgi_responder, -bai_responder_carryforward, -bai_responder_carryforward)
+  
+  # set X, y
+  X <- data_clf %>% dplyr::select(-bai_remitter_carryforward)
+  y <- data_clf$bai_remitter_carryforward
+  
+}else{
+  
+  print("Excluding carryforward outcomes")
+  
+  data_clf <- data %>%
+    filter(complete.cases(bai_remitter)) %>%
+    filter(bdi_1_1_bdi >= bdi_min) %>%  # minimum depression severity for entry
+    dplyr::select(-matches("_2_12_|_1_12_|id|_change")) %>%
+    dplyr::select(-bdi_responder, -bai_responder, -bdi_remitter, -bai_remitter_carryforward,
+                  -cgi_responder, -bai_responder_carryforward, -bai_responder_carryforward)
+  
+  # set X, y
+  X <- data_clf %>% dplyr::select(-bai_remitter)
+  y <- data_clf$bai_remitter
+  
+}
+
+# check missings
+idx_missing <- which(is.na(X), arr.ind = T)
+table(idx_missing[, 2])/nrow(X) >= 0.3 # don't bother imputing if missing rate >=30%
+
+# drop all missing since rate is high
+X <- X[, !names(X) %in% names(X)[unique(idx_missing[, 2])]]
+
+## Here we might decide a-priori to filter specific EEG metrics and/or frequency bands
+X <- X %>% 
+  dplyr::select(-contains("Alpha")) %>%
+  dplyr::select(-contains("Beta")) %>%
+  dplyr::select(-contains("Gamma")) %>%
+  dplyr::select(-contains("Theta")) %>%
+  dplyr::select(-contains("Imag_Coherence")) %>%
+  dplyr::select(-contains("WPLI")) %>%
+  dplyr::select(-contains("WPPC"))
+
+```
+
+## 
+
+## Patient table
+
+```{r}
+# patient summary table
+patient_summary_table <- function(data){
+  
+  # summarize
+  cat_vars <- grep('bai_remitter|gender_M|tms_1_1_', names(data), value = T)
+  
+  summary_vars <- unique(c(grep('age|bai_|bdi_|cgi_|msm', names(data), value = T), cat_vars))
+  
+  tab_one <- CreateTableOne(vars=summary_vars,
+                            strata = grep('bai_remitter', names(data), value = T),
+                            factorVars = cat_vars,
+                            addOverall = TRUE,
+                            data=data)
+  kableone(tab_one)
+  
+}
+
+patient_summary_table(data = data_clf)
+```
+
+## 
+
+## Add base learners
+
+```{r}
+# ranger
+#mtry_seq <- floor(sqrt(ncol(X[grep('_Delta_Coherence|bdi_|bai_|cgi_|msm|tms_|gender_M|age', names(X))])) * c(1)) # based on measure-by-freuqency band subsets
+mtry_seq <- c(2, 3)
+ranger_learners <- create.Learner("SL.ranger", tune = list(mtry = mtry_seq, num.trees=c(1000)), detailed_names = TRUE)
+
+# glmnet/elastic net
+enet_learners <- create.Learner("SL.glmnet", tune = list(alpha = seq(0, 1, length.out=3)), detailed_names = TRUE)
+#enet_learners <- create.Learner("SL.glmnet", tune = list(alpha = 1), detailed_names = TRUE)
+
+xgb_tune <- list(ntrees = c(50, 100),
+                 max_depth = 1:3,
+                 shrinkage = c(0.001, 0.01, 0.1))
+xgb_learners <- create.Learner("SL.xgboost", tune = xgb_tune, detailed_names = TRUE, name_prefix = "xgb")
+
+svm_tune <- list(cost = c(0.1, 1, 10),
+                 gamma = c(0.001, 0.01, 0.1, 1),
+                 kernel = 'radial')
+
+svm_learners <- create.Learner("SL.svm", tune = svm_tune, detailed_names = TRUE, name_prefix = 'svm') 
+```
+
+## Enable multicore processing
+
+```{r}
+num_cores <- RhpcBLASctl::get_num_cores()
+options(mc.cores = num_cores - 2)
+getOption("mc.cores")
+```
+
+## Fit Superlearner model
+
+```{r}
+cv_control <- SuperLearner.CV.control(
+  V = n_folds,                # Number of folds
+  stratifyCV = TRUE,     # Enable stratified sampling
+  shuffle = TRUE         # Shuffle data before splitting
+)
+
+set.seed(1, "L'Ecuyer-CMRG")
+cv_sl = CV.SuperLearner(Y=y, 
+                        X=X, 
+                        family = binomial(), 
+                        cvControl = cv_control,
+                        method = "method.AUC",
+                        SL.library = c("SL.mean", ranger_learners$names, 
+                                       enet_learners$names))
+```
+
+## Model performance
+
+### Summary: AUC
+
+```{r}
+summary(cv_sl)
+```
+
+### Weight distribution
+
+```{r}
+review_weights = function(cv_sl) {
+  meta_weights = coef(cv_sl)
+  means = colMeans(meta_weights)
+  sds = apply(meta_weights, MARGIN = 2,  FUN = sd)
+  mins = apply(meta_weights, MARGIN = 2, FUN = min)
+  maxs = apply(meta_weights, MARGIN = 2, FUN = max)
+  # Combine the stats into a single matrix.
+  sl_stats = cbind("mean(weight)" = means, "sd" = sds, "min" = mins, "max" = maxs)
+  # Sort by decreasing mean weight.
+  sl_stats[order(sl_stats[, 1], decreasing = TRUE), ]
+}
+
+print(review_weights(cv_sl), digits = 3)
+```
+
+### Plot learner performance
+
+```{r}
+plot(cv_sl)
+```
+
+## Check calibration
+
+```{r}
+# save predicted probabilities for each model
+sl_probs <- data.frame(cv_sl$library.predict)
+sl_probs$SL_model <- cv_sl$SL.predict
+sl_probs$outcome <- y
+
+# Fit beta calibration model
+calibration_model <- beta_calibration(
+  p = sl_probs$SL_model,
+  y = sl_probs$outcome,
+  parameters = "abm"
+)
+
+calibrated_probs <- beta_predict(sl_probs$SL_model, calibration_model)
+
+# check calibration with giviti
+belt_uncal <- givitiCalibrationBelt(sl_probs$outcome, sl_probs$SL_model, devel = "external")
+belt_cal <- givitiCalibrationBelt(sl_probs$outcome, calibrated_probs, devel = "external")
+
+par(mfrow=c(1, 2))
+plot(belt_uncal, main = 'Uncalibrated')
+plot(belt_cal, main = 'Beta Calibration')
+
+if(belt_uncal$statistic <= belt_cal$statistic){
+  print("Uncalibrated model GiViTI statistic value is as good or better than beta calibration")
+  print(sprintf("Beta calibration = %s; Uncalibrated = %s", belt_cal$statistic, belt_uncal$statistic))
+  
+  # set final model
+  sl_probs$SL_model_final <- sl_probs$SL_model
+  
+}else{
+  print("Beta calibrated model GiViTI statistic value is better than uncalibrated")
+  print(sprintf("Beta calibration = %s; Uncalibrated = %s", belt_cal$statistic, belt_uncal$statistic))
+  
+  # set final model
+  sl_probs$SL_model_final <- calibrated_probs
+}
+```
+
+### ROC and PR Curves
+
+```{r}
+# determine whether first or second level is needed
+print(as.factor(sl_probs$outcome))
+
+# compute roc and pr curves
+roc_plot <- sl_probs %>%
+  mutate(outcome=as.factor(outcome)) %>%
+  roc_curve(outcome, SL_model_final, event_level = 'second') %>%
+  autoplot()
+
+pr_plot <- sl_probs %>%
+  mutate(outcome=as.factor(outcome)) %>%
+  pr_curve(outcome, SL_model_final, event_level = 'second') %>%
+  autoplot()
+
+ggarrange(roc_plot, pr_plot, ncol = 2, nrow = 1)
+
+# AUC-ROC value
+sl_probs %>%
+  mutate(outcome=as.factor(outcome)) %>%
+  yardstick::roc_auc(outcome, SL_model_final, event_level = 'second')
+
+# AUC-PR value
+sl_probs %>%
+  mutate(outcome=as.factor(outcome)) %>%
+  yardstick::pr_auc(outcome, SL_model_final, event_level = 'second')
+```
+
+## Decision Curve Analysis
+
+```{r}
+dc_data <- dcurves::dca(outcome ~ SL_model_final, data = sl_probs) %>%
+  plot(smooth = TRUE)
+  
+dc_data
+
+# calculate difference in model-based versus treat-all-based net benefit
+dc_df <- data.frame(dc_data$data)
+dc_df_ta <- dc_df[dc_df$label=='Treat All', ]
+dc_df_mod <- dc_df[dc_df$label=='SL_model_final', ]
+dc_df_mod$net_benefit_gain <- dc_df_mod$net_benefit - dc_df_ta$net_benefit
+
+# subset over "reasonable range" and region of imporovement
+tmp <- dc_df_mod[dc_df_mod$threshold < 0.45 & dc_df_mod$net_benefit_gain > 0, ]
+tmp$nnt_gain <- (1/tmp$net_benefit_gain)
+tmp$log_nnt_gain <- log(tmp$nnt_gain)
+
+
+p1 <- ggplot(tmp, aes(threshold, net_benefit_gain)) + 
+  geom_point(col='lightblue', size = 2) + 
+  geom_line() + 
+  ylab("Net Benefit Gain") + 
+  xlab("Threshold Probability") + 
+  theme_bw()
+
+p2 <- ggplot(tmp, aes(threshold, log_nnt_gain)) + 
+  geom_point(col='lightblue', size = 2) + 
+  geom_line() + 
+  ylab("Log NNT Gain") + 
+  xlab("Threshold Probability") + 
+  theme_bw()
+
+ggarrange(p1, p2, ncol=2, nrow=1)
+
+# report gain in NNT quantiles
+kable(quantile(tmp$nnt_gain), caption = "NNT Gain Quantiles")
+```
+
+## Remission rates by cross-validated remission probability deciles
+
+```{r}
+pdist <- sl_probs$SL_model_final
+
+decile_membership <- ntile(pdist, 4) # adjust to accomodate sample size
+
+decile_df <- data.frame(
+  pdist=pdist,
+  remission=y,
+  decile=decile_membership
+)
+
+decile_df %>%
+  group_by(decile) %>%
+  summarise(support = n(),
+            min_p = min(pdist),
+            proportion_remission = sum(remission==1) / n()) %>%
+  kable()
+
+decile_plt <- decile_df %>%
+  group_by(decile) %>%
+  summarise(support = n(),
+            min_p = min(pdist),
+            proportion_remission = sum(remission==1) / n()) 
+  
+ggplot(decile_plt, aes(as.factor(decile), proportion_remission)) + 
+  geom_bar(stat = 'identity') + 
+  ylim(0, 1) + 
+  geom_hline(yintercept=0.5, linetype="dashed", color = "red") +
+  theme_bw()
+```
+
+## SHAP analysis
+
+```{r}
+
+if(shap_report){
+
+  refit_data <- data.frame(outcome=y, X)
+  refit_data$outcome <- as.factor(refit_data$outcome)
+  
+  # subset refit data on most predictive EEG frequency band/measure
+  refit_data <- refit_data[, names(refit_data) %in% grep('outcome|_Delta_Coherence|bdi_|bai_|cgi_|msm|tms_|gender_M|age', names(refit_data), value = T)]
+  
+  
+  # refit best learner model
+  rf_mod <- rand_forest(mode = 'classification', 
+                        trees = 1000,
+                        mtry = 2) %>%
+    set_engine('ranger')
+  
+  rec <- 
+    recipe(outcome ~ ., data = refit_data)
+  
+  # set workflow
+  rf_workflow <- 
+    workflow() %>% 
+    add_recipe(rec) %>% 
+    add_model(rf_mod)
+  
+  set.seed(123)
+  shap_mod <- rf_workflow %>%
+    fit(refit_data)
+  
+  shap_data <- refit_data %>% dplyr::select(-outcome)
+  
+  pred_fun <- function(object, newdata) {
+    predict(object, newdata, type = "prob") %>% dplyr::select(2)  # Probability of class "1"
+  }
+  
+  set.seed(1)
+  shap_sample_index <- sample(x=1:nrow(shap_data), size = 50, replace = FALSE)
+  
+  shap_explainer <- kernelshap(shap_mod, 
+                               X = shap_data, 
+                               bg_X = shap_data[shap_sample_index, ],
+                               pred_fun = pred_fun, 
+                               verbose = FALSE)
+
+}else{
+  print("Skipping SHAP")
+}
+  
+```
+
+### Beeswarm plot
+
+```{r}
+
+if(shap_report){
+  sv <- shapviz(shap_explainer, X = shap_data)
+  beeswarm <- sv_importance(sv, kind = "bee")
+  beeswarm
+}else{
+  print("Skipping SHAP")
+}
+```
