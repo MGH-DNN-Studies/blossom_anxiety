@@ -140,7 +140,11 @@ patient_summary_table <- function(data){
 patient_summary_table(data = data_clf)
 ```
 
-## 
+## Print predictors
+
+```{r}
+print(head(X))
+```
 
 ## Add base learners
 
